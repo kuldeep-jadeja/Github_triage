@@ -197,9 +197,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
 async def process_triage(job_id: int, trace_id: str):
     """
-    Async triage processing. This is where the LangGraph orchestrator runs.
-    For Phase 1, this is a placeholder that updates job status.
-    Phase 2 will wire in the full orchestrator.
+    Async triage processing using the LangGraph orchestrator.
+    Runs the full state machine: intake → analyze → search → decide → draft → critique → policy → complete.
     """
     TraceContext.set(trace_id)
     logger.info(
@@ -207,19 +206,72 @@ async def process_triage(job_id: int, trace_id: str):
         extra={"extra_context": {"job_id": job_id, "trace_id": trace_id}},
     )
 
-    from backend.database import update_job
+    from backend.database import update_job, get_job
+    from backend.orchestrator import build_triage_graph
+    from backend.models import TriageState
+    from backend.github_tools import GitHubTools
+
+    job = get_job(job_id)
+    if not job:
+        logger.error(f"Job {job_id} not found")
+        return
+
     update_job(job_id, status="running")
 
-    # TODO: Phase 2 — wire in LangGraph orchestrator here
-    # graph = build_triage_graph()
-    # result = await graph.ainvoke(initial_state)
+    try:
+        # Build initial state
+        initial_state = TriageState(
+            issue_id=job["issue_id"],
+            issue_number=job["issue_number"],
+            repo_full_name=job["repo_full_name"],
+            event_type=job["event_type"],
+            title=job.get("title") or "",
+            body=job.get("body") or "",
+            author=job.get("author") or "",
+            trace_id=trace_id,
+        )
 
-    update_job(job_id, status="pending_review")
+        # Run the orchestrator
+        graph = build_triage_graph()
+        result = await graph.ainvoke(initial_state)
 
-    logger.info(
-        "Triage processing complete",
-        extra={"extra_context": {"job_id": job_id, "trace_id": trace_id}},
-    )
+        # Persist results to DB
+        update_job(
+            job_id,
+            status=result.get("status", "pending_review"),
+            suggested_labels=str(result.get("suggested_labels", [])),
+            suggested_priority=result.get("suggested_priority", "P2"),
+            confidence=result.get("confidence", 0.0),
+            reasoning=result.get("reasoning", ""),
+            draft_comment=result.get("draft_comment", ""),
+            critique_notes=result.get("critique_notes", ""),
+            trace_log=str(result.get("trace_log", [])),
+        )
+
+        # If auto-label is applicable, execute immediately
+        if result.get("status") == "auto_labeled":
+            tools = GitHubTools(repo_name=job["repo_full_name"])
+            labels = result.get("suggested_labels", [])
+            if labels:
+                tools.apply_labels(job["issue_number"], labels)
+            update_job(job_id, executed_at=datetime.now(timezone.utc).isoformat())
+
+        logger.info(
+            "Triage processing complete",
+            extra={"extra_context": {
+                "job_id": job_id,
+                "status": result.get("status", "pending_review"),
+                "confidence": result.get("confidence", 0.0),
+                "trace_id": trace_id,
+            }},
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Triage processing failed: {e}",
+            extra={"extra_context": {"job_id": job_id, "trace_id": trace_id}},
+        )
+        update_job(job_id, status="error", error=str(e))
 
 
 # --- Dashboard API ---
