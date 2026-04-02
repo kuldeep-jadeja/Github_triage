@@ -1,4 +1,5 @@
 {
+  "$schema": "https://opencode.ai/config.json",
   "permission": {
     "read": {
       "C:/Users/kulde/OneDrive/Desktop/Github_triage/.opencode/get-shit-done/*": "allow"
