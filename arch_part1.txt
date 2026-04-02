@@ -1,0 +1,20 @@
+# Architecture Research -- AI GitHub Triage Agent
+
+## Component Boundaries
+
+The system decomposes into six loosely-coupled components, each with a single responsibility:
+
+| Component | Responsibility | Technology Candidates |
+|-----------|---------------|----------------------|
+| **Webhook Ingress** | Receives, verifies, and normalizes GitHub webhook payloads; enforces HMAC signature validation | FastAPI / Express.js + Hookdeck (edge gateway) |
+| **Event Router** | Dispatches events to the appropriate processing pipeline based on event type (issues, pull_request, etc.) | In-memory router or message queue (Redis Streams, RabbitMQ) |
+| **AI Processing Engine** | Runs the multi-step LLM workflow: classify, label, score, suggest assignees | LangGraph (Python) or custom state machine |
+| **Vector Search Service** | Stores and queries embeddings of historical issues/PRs for similarity matching | Pinecone, Weaviate, or pgvector |
+| **Action Executor** | Applies labels, assigns users, posts comments, closes duplicates via GitHub API | GitHub REST/GraphQL API client with rate-limit awareness |
+| **Dashboard and Audit** | Real-time UI showing triage decisions, approval queues, and structured decision logs | WebSocket + React/Svelte + structured JSON log store |
+
+### Boundary Principles
+
+1. **Webhook Ingress never calls the LLM directly.** It validates, normalizes, and enqueues. This keeps the ingress path fast and stateless.
+2. **AI Processing Engine never calls GitHub APIs directly.** It produces structured decisions (JSON); the Action Executor applies them. This separation enables human-in-the-loop gates and audit trails.
+3. **Vector Search is a read-only sidecar.** The AI engine queries it; it never writes back during triage. Embedding writes happen in a separate indexing pipeline.

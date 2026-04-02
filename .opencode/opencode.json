@@ -1,0 +1,10 @@
+{
+  "permission": {
+    "read": {
+      "C:/Users/kulde/OneDrive/Desktop/Github_triage/.opencode/get-shit-done/*": "allow"
+    },
+    "external_directory": {
+      "C:/Users/kulde/OneDrive/Desktop/Github_triage/.opencode/get-shit-done/*": "allow"
+    }
+  }
+}
