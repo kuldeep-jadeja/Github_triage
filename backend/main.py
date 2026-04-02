@@ -1,25 +1,65 @@
 """
-FastAPI application with webhook receiver, health check, and dashboard API.
+FastAPI application with webhook receiver, health check, dashboard API, and WebSocket.
 Returns 200 immediately from webhooks, processes asynchronously.
 """
 
 import uuid
 import hmac
 import hashlib
+import json
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Dict, Set
 
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.config import settings
-from backend.database import init_db, check_integrity, recreate_db, create_job, get_job_by_issue_id, get_pending_jobs, get_recent_jobs, get_metrics, log_llm_call
+from backend.database import (
+    init_db, check_integrity, recreate_db, create_job, get_job_by_issue_id,
+    get_pending_jobs, get_recent_jobs, get_metrics, log_llm_call,
+    get_job, update_job,
+)
 from backend.logging_config import setup_logging, TraceContext, get_logger
-from backend.models import WebhookPayload
 
 logger = get_logger(__name__)
+
+
+# --- WebSocket Manager ---
+
+class ConnectionManager:
+    """Manages WebSocket connections and broadcasts events to all clients."""
+
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"WebSocket connected. Total: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        logger.info(f"WebSocket disconnected. Total: {len(self.active_connections)}")
+
+    async def broadcast(self, event: dict):
+        """Send an event to all connected clients."""
+        message = json.dumps(event)
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception:
+                disconnected.append(connection)
+        for conn in disconnected:
+            self.disconnect(conn)
+
+
+manager = ConnectionManager()
 
 
 @asynccontextmanager
@@ -64,10 +104,8 @@ app.add_middleware(
 async def health_check():
     """Health check endpoint. Returns 200 only if all dependencies are healthy."""
     db_healthy = check_integrity()
-
     status = "healthy" if db_healthy else "degraded"
     status_code = 200 if db_healthy else 503
-
     return JSONResponse(
         status_code=status_code,
         content={
@@ -76,6 +114,29 @@ async def health_check():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     )
+
+
+@app.websocket("/ws/events")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time triage progress updates."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive — client sends ping, we respond
+            data = await websocket.receive_text()
+            # Echo back for keepalive
+            await websocket.send_text(json.dumps({"type": "pong"}))
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+async def broadcast_event(event_type: str, data: dict):
+    """Helper to broadcast an event to all WebSocket clients."""
+    await manager.broadcast({
+        "type": event_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **data,
+    })
 
 
 @app.post("/webhook")
@@ -111,7 +172,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
     # 2. Parse and validate payload
     try:
-        import json
         payload = json.loads(body)
     except json.JSONDecodeError:
         logger.error("Malformed JSON payload", extra={"extra_context": {"trace_id": trace_id}})
@@ -126,23 +186,19 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         if not issue_data or "id" not in issue_data:
             logger.error("Missing issue data in payload", extra={"extra_context": {"trace_id": trace_id}})
             raise HTTPException(status_code=400, detail="Missing issue data")
-
         issue_id = issue_data["id"]
         issue_number = issue_data.get("number", 0)
         repo = payload.get("repository", {})
         repo_full_name = repo.get("full_name", "unknown/repo")
-
     elif event_type == "pull_request" and action == "opened":
         pr_data = payload.get("pull_request", {})
         if not pr_data or "id" not in pr_data:
             logger.error("Missing PR data in payload", extra={"extra_context": {"trace_id": trace_id}})
             raise HTTPException(status_code=400, detail="Missing pull_request data")
-
         issue_id = pr_data["id"]
         issue_number = pr_data.get("number", 0)
         repo = payload.get("repository", {})
         repo_full_name = repo.get("full_name", "unknown/repo")
-
     else:
         logger.info(
             "Ignoring webhook event",
@@ -192,6 +248,14 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     # 5. Enqueue for async processing
     background_tasks.add_task(process_triage, job_id, trace_id)
 
+    # Broadcast to dashboard
+    asyncio.create_task(broadcast_event("triage_started", {
+        "job_id": job_id,
+        "issue_number": issue_number,
+        "title": title,
+        "status": "queued",
+    }))
+
     return {"status": "queued", "job_id": job_id, "trace_id": trace_id}
 
 
@@ -206,7 +270,6 @@ async def process_triage(job_id: int, trace_id: str):
         extra={"extra_context": {"job_id": job_id, "trace_id": trace_id}},
     )
 
-    from backend.database import update_job, get_job
     from backend.orchestrator import build_triage_graph
     from backend.models import TriageState
     from backend.github_tools import GitHubTools
@@ -217,9 +280,13 @@ async def process_triage(job_id: int, trace_id: str):
         return
 
     update_job(job_id, status="running")
+    await broadcast_event("triage_progress", {
+        "job_id": job_id,
+        "status": "running",
+        "step": "Starting analysis...",
+    })
 
     try:
-        # Build initial state
         initial_state = TriageState(
             issue_id=job["issue_id"],
             issue_number=job["issue_number"],
@@ -231,14 +298,13 @@ async def process_triage(job_id: int, trace_id: str):
             trace_id=trace_id,
         )
 
-        # Run the orchestrator
         graph = build_triage_graph()
         result = await graph.ainvoke(initial_state)
 
-        # Persist results to DB
+        status = result.get("status", "pending_review")
         update_job(
             job_id,
-            status=result.get("status", "pending_review"),
+            status=status,
             suggested_labels=str(result.get("suggested_labels", [])),
             suggested_priority=result.get("suggested_priority", "P2"),
             confidence=result.get("confidence", 0.0),
@@ -249,18 +315,30 @@ async def process_triage(job_id: int, trace_id: str):
         )
 
         # If auto-label is applicable, execute immediately
-        if result.get("status") == "auto_labeled":
+        if status == "auto_labeled":
             tools = GitHubTools(repo_name=job["repo_full_name"])
             labels = result.get("suggested_labels", [])
             if labels:
                 tools.apply_labels(job["issue_number"], labels)
             update_job(job_id, executed_at=datetime.now(timezone.utc).isoformat())
+            await broadcast_event("triage_complete", {
+                "job_id": job_id,
+                "status": "auto_labeled",
+                "labels": labels,
+                "confidence": result.get("confidence", 0.0),
+            })
+        else:
+            await broadcast_event("triage_complete", {
+                "job_id": job_id,
+                "status": status,
+                "confidence": result.get("confidence", 0.0),
+            })
 
         logger.info(
             "Triage processing complete",
             extra={"extra_context": {
                 "job_id": job_id,
-                "status": result.get("status", "pending_review"),
+                "status": status,
                 "confidence": result.get("confidence", 0.0),
                 "trace_id": trace_id,
             }},
@@ -272,6 +350,10 @@ async def process_triage(job_id: int, trace_id: str):
             extra={"extra_context": {"job_id": job_id, "trace_id": trace_id}},
         )
         update_job(job_id, status="error", error=str(e))
+        await broadcast_event("triage_error", {
+            "job_id": job_id,
+            "error": str(e),
+        })
 
 
 # --- Dashboard API ---
@@ -286,7 +368,6 @@ async def get_pending_reviews():
 @app.get("/api/reviews/{job_id}")
 async def get_review(job_id: int):
     """Get full triage result for a specific job."""
-    from backend.database import get_job
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Review not found")
@@ -295,35 +376,115 @@ async def get_review(job_id: int):
 
 @app.post("/api/reviews/{job_id}/approve")
 async def approve_review(job_id: int):
-    """Approve a triage review and execute actions."""
-    from backend.database import get_job, update_job
+    """Approve a triage review and execute actions on GitHub."""
+    from backend.github_tools import GitHubTools
+
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Review not found")
-    if job["status"] != "pending_review":
+    if job["status"] not in ("pending_review", "auto_labeled"):
         raise HTTPException(status_code=409, detail=f"Cannot approve job in state '{job['status']}'")
 
     # Optimistic locking: reject if version changed
     update_job(job_id, status="executed", approved_at=datetime.now(timezone.utc).isoformat())
 
-    # TODO: Phase 3 — execute GitHub API calls here
-    logger.info("Review approved", extra={"extra_context": {"job_id": job_id}})
+    # Execute on GitHub
+    tools = GitHubTools(repo_name=job["repo_full_name"])
+
+    # Apply labels
+    import ast
+    try:
+        labels = ast.literal_eval(job.get("suggested_labels") or "[]")
+    except (ValueError, SyntaxError):
+        labels = []
+
+    if labels:
+        tools.apply_labels(job["issue_number"], labels)
+
+    # Post comment (use edited draft if available, otherwise original)
+    draft = job.get("edited_draft") or job.get("draft_comment") or ""
+    if draft:
+        tools.post_comment(job["issue_number"], draft)
+
+    update_job(job_id, executed_at=datetime.now(timezone.utc).isoformat())
+    await broadcast_event("review_approved", {"job_id": job_id, "issue_number": job["issue_number"]})
+
+    logger.info("Review approved and executed", extra={"extra_context": {"job_id": job_id}})
     return {"status": "approved", "job_id": job_id}
 
 
 @app.post("/api/reviews/{job_id}/reject")
 async def reject_review(job_id: int):
     """Reject a triage review."""
-    from backend.database import get_job, update_job
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Review not found")
-    if job["status"] != "pending_review":
+    if job["status"] not in ("pending_review", "auto_labeled"):
         raise HTTPException(status_code=409, detail=f"Cannot reject job in state '{job['status']}'")
 
     update_job(job_id, status="rejected")
+    await broadcast_event("review_rejected", {"job_id": job_id})
     logger.info("Review rejected", extra={"extra_context": {"job_id": job_id}})
     return {"status": "rejected", "job_id": job_id}
+
+
+@app.post("/api/reviews/{job_id}/edit")
+async def edit_review(job_id: int, request: Request):
+    """Edit a draft comment before approval. Stores the edited version."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Review not found")
+    if job["status"] not in ("pending_review", "auto_labeled"):
+        raise HTTPException(status_code=409, detail=f"Cannot edit job in state '{job['status']}'")
+
+    body = await request.json()
+    edited_draft = body.get("draft_comment", "")
+    if not edited_draft:
+        raise HTTPException(status_code=400, detail="draft_comment is required")
+
+    original_draft = job.get("draft_comment") or ""
+    update_job(job_id, edited_draft=edited_draft)
+
+    logger.info("Draft edited", extra={"extra_context": {"job_id": job_id}})
+    return {
+        "status": "edited",
+        "job_id": job_id,
+        "original": original_draft,
+        "edited": edited_draft,
+    }
+
+
+@app.post("/api/reviews/{job_id}/undo")
+async def undo_auto_label(job_id: int):
+    """Undo an auto-labeled triage — removes the labels that were applied."""
+    from backend.github_tools import GitHubTools
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Review not found")
+    if job["status"] != "auto_labeled":
+        raise HTTPException(status_code=409, detail="Can only undo auto-labeled reviews")
+
+    # Remove the labels that were applied
+    import ast
+    try:
+        labels = ast.literal_eval(job.get("suggested_labels") or "[]")
+    except (ValueError, SyntaxError):
+        labels = []
+
+    if labels:
+        tools = GitHubTools(repo_name=job["repo_full_name"])
+        try:
+            issue = tools.repo.get_issue(job["issue_number"])
+            for label in labels:
+                issue.remove_from_labels(label)
+            logger.info(f"Removed labels {labels} from #{job['issue_number']}")
+        except Exception as e:
+            logger.error(f"Failed to remove labels: {e}")
+
+    update_job(job_id, status="pending_review")
+    await broadcast_event("label_undone", {"job_id": job_id})
+    return {"status": "undone", "job_id": job_id}
 
 
 @app.get("/api/reviews/history")
